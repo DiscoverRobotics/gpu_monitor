@@ -26,7 +26,7 @@ fail()  { printf '\033[1;31m[server]\033[0m %s\n' "$*" >&2; exit 1; }
 install_docker() {
   say "docker not found — installing via official convenience script ..."
   curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-  sh /tmp/get-docker.sh
+  sh /tmp/get-docker.sh --mirror Aliyun
   rm -f /tmp/get-docker.sh
   # allow current user to run docker without sudo (takes effect on next login)
   if [ "$(id -u)" -ne 0 ] && ! groups | grep -qw docker; then

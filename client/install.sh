@@ -70,7 +70,7 @@ fail()  { printf '\033[1;31m[client]\033[0m %s\n' "$*" >&2; exit 1; }
 install_docker() {
   say "docker not found — installing via official convenience script ..."
   curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-  sh /tmp/get-docker.sh
+  sh /tmp/get-docker.sh --mirror Aliyun
   rm -f /tmp/get-docker.sh
   # allow current user to run docker without sudo (takes effect on next login)
   if [ "$(id -u)" -ne 0 ] && ! groups | grep -qw docker; then
@@ -120,12 +120,39 @@ fi
 command -v nvidia-smi >/dev/null 2>&1 \
   || fail "nvidia-smi not found — install the NVIDIA driver before deploying the exporter."
 
-# 3. NVIDIA Container Toolkit
+# 3. NVIDIA Container Toolkit — auto-install if missing.
+install_nvidia_ctk() {
+  say "NVIDIA Container Toolkit not detected — installing ..."
+  if command -v apt-get >/dev/null 2>&1; then
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+      | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+      | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+      | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+    sudo apt-get update
+    sudo apt-get install -y nvidia-container-toolkit
+  elif command -v yum >/dev/null 2>&1; then
+    curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+      | sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null
+    sudo yum install -y nvidia-container-toolkit
+  elif command -v dnf >/dev/null 2>&1; then
+    curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
+      | sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null
+    sudo dnf install -y nvidia-container-toolkit
+  else
+    fail "unsupported package manager — install NVIDIA Container Toolkit manually: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html"
+  fi
+  sudo nvidia-ctk runtime configure --runtime=docker
+  if command -v systemctl >/dev/null 2>&1; then
+    sudo systemctl restart docker
+  fi
+  say "NVIDIA Container Toolkit installed successfully."
+}
+
 if ! docker info 2>/dev/null | grep -qi 'Runtimes:.*nvidia'; then
-  warn "NVIDIA Container Toolkit not detected in 'docker info'."
-  warn "Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html"
-  warn "Then: sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker"
-  fail "Aborting — exporter cannot access GPUs without the toolkit."
+  install_nvidia_ctk
+  docker info 2>/dev/null | grep -qi 'Runtimes:.*nvidia' \
+    || fail "NVIDIA Container Toolkit installation failed — install manually: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html"
 fi
 
 # 4. Inside the container, 127.0.0.1/localhost would resolve to the container
