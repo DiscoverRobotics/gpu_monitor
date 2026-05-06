@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Enable --web.enable-remote-write-receiver on the central Prometheus.
+# Enable --web.enable-remote-write-receiver on the server Prometheus.
 #
-# Run this on 143.198.139.25 after `ssh`-ing in. It detects how Prometheus
-# is deployed (docker-compose / docker run / systemd), proposes the change,
+# Use this to retrofit an *already-running* Prometheus that predates this
+# stack and that you don't want to replace via install.sh. It detects how
+# Prometheus is deployed (docker-compose / docker run), proposes the change,
 # and applies it only after you confirm (or pass --apply).
+#
+# Designed to be run via:
+#   sh -c "$(curl -fsSL https://raw.githubusercontent.com/DiscoverRobotics/gpu_monitor/main/server/enable-remote-write.sh)" -- --apply
 #
 # Re-running is a no-op once the flag is on.
 set -euo pipefail
@@ -16,7 +20,11 @@ for arg in "$@"; do
   case "$arg" in
     --apply|-y) APPLY=1 ;;
     -h|--help)
-      sed -n '2,8p' "$0"; exit 0 ;;
+      sed -n '2,12p' "$0" 2>/dev/null || cat <<'USAGE'
+Enable --web.enable-remote-write-receiver on an existing Prometheus.
+Options: --apply | -y    Skip the interactive confirm prompts.
+USAGE
+      exit 0 ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
@@ -118,13 +126,11 @@ while i < len(lines):
         out.append(line); i += 1; continue
     if in_service:
         if stripped.strip() and line_indent(line) <= service_indent and not stripped.startswith('#'):
-            # Left the service block without finding command:
             raise SystemExit(f"ERROR: did not find a 'command:' list under service '{service}' in {path}; edit by hand.")
         m = re.match(r'^(\s+)command:\s*$', line)
         if m:
             cmd_indent = len(m.group(1))
             out.append(line); i += 1
-            # collect existing command list items
             item_indent = None
             while i < len(lines):
                 l = lines[i]
