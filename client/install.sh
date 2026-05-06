@@ -213,6 +213,10 @@ services:
       - --web.listen-address=:9091
     ports:
       - "127.0.0.1:${AGENT_PORT:-9091}:9091"
+    environment:
+      - http_proxy=${HTTP_PROXY}
+      - https_proxy=${HTTPS_PROXY}
+      - no_proxy=localhost,127.0.0.1,dcgm-exporter,host.docker.internal
 
 volumes:
   prom-agent-data:
