@@ -216,7 +216,7 @@ services:
     environment:
       - http_proxy=${HTTP_PROXY}
       - https_proxy=${HTTPS_PROXY}
-      - no_proxy=localhost,127.0.0.1,dcgm-exporter,host.docker.internal
+      - no_proxy=localhost,127.0.0.1,43.133.11.173,dcgm-exporter,host.docker.internal
 
 volumes:
   prom-agent-data:
