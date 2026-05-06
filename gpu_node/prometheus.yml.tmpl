@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    instance: __INSTANCE_LABEL__
+
+scrape_configs:
+  - job_name: dcgm
+    static_configs:
+      - targets: ["dcgm-exporter:9400"]
+        labels:
+          instance: __INSTANCE_LABEL__
+
+remote_write:
+  - url: __REMOTE_WRITE_URL__
+    queue_config:
+      max_samples_per_send: 1000
+      capacity: 10000
+      batch_send_deadline: 5s
+    write_relabel_configs:
+      - source_labels: [__name__]
+        regex: "DCGM_.*"
+        action: keep

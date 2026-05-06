@@ -1,0 +1,46 @@
+# Central visualization stack.
+#
+# Runs Prometheus (with the remote-write receiver enabled) and Grafana.
+# GPU nodes push samples to Prometheus over /api/v1/write; Grafana renders
+# them. Both services bind to all interfaces by default — restrict at the
+# host firewall if the host is publicly reachable.
+#
+# Usage:
+#   ./deploy.sh                # one-click bring-up
+#   docker compose up -d       # equivalent manual command
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: gpu-monitor-central-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-remote-write-receiver
+      - --web.enable-lifecycle
+      - --web.listen-address=:9090
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: gpu-monitor-central-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+
+volumes:
+  prom-data:
+  grafana-data:

@@ -1,0 +1,58 @@
+# GPU node deployment.
+#
+# This host sits behind NAT, so the central Prometheus at
+# http://143.198.139.25:9090/ cannot scrape it directly. Instead we run a
+# local Prometheus in agent mode that scrapes dcgm-exporter over the compose
+# network and remote_writes the samples to the central Prometheus.
+#
+# Prerequisites on the host:
+#   - NVIDIA driver
+#   - NVIDIA Container Toolkit (`docker info` shows `nvidia` under Runtimes)
+#
+# Usage:
+#   ./deploy.sh                # one-click bring-up
+#   docker compose up -d       # equivalent manual command
+services:
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.5-3.4.1-ubuntu22.04
+    container_name: gpu-monitor-dcgm-exporter
+    restart: unless-stopped
+    cap_add:
+      - SYS_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
+    ports:
+      - "${EXPORTER_PORT:-9400}:9400"
+    environment:
+      DCGM_EXPORTER_LISTEN: ":9400"
+      DCGM_EXPORTER_KUBERNETES: "false"
+
+  prometheus-agent:
+    image: prom/prometheus:v2.55.0
+    container_name: gpu-monitor-prometheus-agent
+    restart: unless-stopped
+    depends_on:
+      - dcgm-exporter
+    # Lets the agent reach a Prometheus running on the host (useful when
+    # both ends are on the same machine for local testing); harmless when
+    # PROMETHEUS_URL points to a real remote host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-agent-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --enable-feature=agent
+      - --storage.agent.path=/prometheus
+      - --web.listen-address=:9091
+    ports:
+      - "127.0.0.1:${AGENT_PORT:-9091}:9091"
+
+volumes:
+  prom-agent-data:
