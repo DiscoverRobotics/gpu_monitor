@@ -66,16 +66,54 @@ say()   { printf '\033[1;36m[client]\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[client]\033[0m %s\n' "$*" >&2; }
 fail()  { printf '\033[1;31m[client]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# 1. Docker
-command -v docker >/dev/null 2>&1 \
-  || fail "docker not found — install Docker first: https://docs.docker.com/engine/install/"
+# 1. Docker — auto-install if missing.
+install_docker() {
+  say "docker not found — installing via official convenience script ..."
+  curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+  sh /tmp/get-docker.sh
+  rm -f /tmp/get-docker.sh
+  # allow current user to run docker without sudo (takes effect on next login)
+  if [ "$(id -u)" -ne 0 ] && ! groups | grep -qw docker; then
+    sudo usermod -aG docker "$(whoami)" || true
+  fi
+  # make sure the daemon is running
+  if command -v systemctl >/dev/null 2>&1; then
+    sudo systemctl enable --now docker
+  fi
+  command -v docker >/dev/null 2>&1 \
+    || fail "docker installation failed — please install manually: https://docs.docker.com/engine/install/"
+  say "docker installed successfully."
+}
+
+install_docker_compose() {
+  say "docker compose not found — installing the v2 plugin ..."
+  local compose_version="v2.29.2"
+  local arch
+  arch="$(uname -m)"
+  case "${arch}" in
+    x86_64)  arch="x86_64" ;;
+    aarch64|arm64) arch="aarch64" ;;
+    *) fail "unsupported architecture: ${arch}" ;;
+  esac
+  local dest="${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins"
+  mkdir -p "${dest}"
+  curl -fsSL "https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-${arch}" \
+    -o "${dest}/docker-compose"
+  chmod +x "${dest}/docker-compose"
+  docker compose version >/dev/null 2>&1 \
+    || fail "docker compose installation failed — please install manually: https://docs.docker.com/compose/install/"
+  say "docker compose installed successfully."
+}
+
+command -v docker >/dev/null 2>&1 || install_docker
 
 if docker compose version >/dev/null 2>&1; then
   COMPOSE=(docker compose)
 elif command -v docker-compose >/dev/null 2>&1; then
   COMPOSE=(docker-compose)
 else
-  fail "Docker Compose not found — install the v2 plugin: https://docs.docker.com/compose/install/"
+  install_docker_compose
+  COMPOSE=(docker compose)
 fi
 
 # 2. NVIDIA driver
