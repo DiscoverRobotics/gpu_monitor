@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # One-click deployment of the GPU push agent on a cluster login node, where
-# the compute nodes can reach the login node but NOT the central Prometheus.
+# the compute nodes can reach the login node but NOT the central Prometheus,
+# AND the login node has no docker / no sudo. The Prometheus binary is
+# downloaded into ${INSTALL_DIR} and run as a plain background process
+# (nohup + PID file). No system packages, no containers, no root.
 #
 # Topology:
 #   compute0N (dcgm-exporter :9400) ──scrape──▶ login node (this script)
@@ -8,9 +11,9 @@
 #                                                    ▼
 #                                              central Prometheus
 #
-# Each compute node must already be running nvidia/dcgm-exporter and exposing
-# /metrics on EXPORTER_PORT (default 9400). This script only sets up the
-# prometheus-agent on the login node; it never tries to touch the compute
+# Each compute node must already be running nvidia/dcgm-exporter and
+# exposing /metrics on EXPORTER_PORT (default 9400). This script only sets
+# up the prometheus-agent on the login node; it never touches the compute
 # nodes.
 #
 # Designed to be run via:
@@ -19,10 +22,13 @@
 #     --GRAFANA_URL    http://<server-host>:3000 \
 #     --COMPUTE_NODES  compute01,compute02,compute03
 #
-# Materializes docker-compose.yml + prometheus.yml under ${INSTALL_DIR}
-# (default: $(pwd)/gpu-monitor-gateway) and brings up:
-#   - prom/prometheus (agent mode) on host network, scraping every compute
-#     node's dcgm-exporter and remote_writing to the central Prometheus.
+# Materializes ${INSTALL_DIR}/prometheus, ${INSTALL_DIR}/prometheus.yml, and
+# launches the agent in the background. Re-running this script gracefully
+# stops the existing process before starting the new one.
+#
+# Sub-commands:
+#   install.sh --STOP        Stop the running agent and exit.
+#   install.sh --STATUS      Report whether the agent is running and exit.
 set -euo pipefail
 
 EXPORTER_PORT="${EXPORTER_PORT:-9400}"
@@ -36,10 +42,15 @@ COMPUTE_NODES="${COMPUTE_NODES:-}"
 COMPUTE_NODES_FILE="${COMPUTE_NODES_FILE:-}"
 ALLOW_NO_NODES="${ALLOW_NO_NODES:-0}"
 INSTALL_DIR="${INSTALL_DIR:-$(pwd)/gpu-monitor-gateway}"
+PROMETHEUS_VERSION="${PROMETHEUS_VERSION:-2.55.0}"
+PROMETHEUS_DOWNLOAD_BASE="${PROMETHEUS_DOWNLOAD_BASE:-https://github.com/prometheus/prometheus/releases/download}"
+ACTION="install"
 
 usage() {
   cat <<EOF
 Usage: install.sh [options]
+       install.sh --STOP
+       install.sh --STATUS
 
 Required (one or both):
   --COMPUTE_NODES <list>       Comma-separated [label=]host[:port] entries.
@@ -58,8 +69,11 @@ Options:
   --SCRAPE_INTERVAL <dur>  Prometheus scrape_interval (default: ${SCRAPE_INTERVAL})
   --EXPORTER_PORT  <port>  Default exporter port when an entry omits it (default: ${EXPORTER_PORT})
   --AGENT_PORT     <port>  Host port for the agent UI on 127.0.0.1 (default: ${AGENT_PORT})
-  --INSTALL_DIR    <dir>   Where to write compose + prometheus.yml (default: ${INSTALL_DIR})
+  --INSTALL_DIR    <dir>   Where to install + run the agent (default: ${INSTALL_DIR})
+  --PROMETHEUS_VERSION <v> Prometheus release to download (default: ${PROMETHEUS_VERSION})
   --ALLOW_NO_NODES         Continue even if zero compute nodes are reachable at pre-flight.
+  --STOP                   Stop the running agent and exit.
+  --STATUS                 Report agent status (running/stopped) and exit.
   -h, --help               Show this help
 
 Environment variables of the same name are honoured as fallbacks; CLI flags win.
@@ -88,7 +102,11 @@ while [ $# -gt 0 ]; do
     --AGENT_PORT=*)       AGENT_PORT="${1#*=}"; shift ;;
     --INSTALL_DIR)        INSTALL_DIR="$2"; shift 2 ;;
     --INSTALL_DIR=*)      INSTALL_DIR="${1#*=}"; shift ;;
+    --PROMETHEUS_VERSION) PROMETHEUS_VERSION="$2"; shift 2 ;;
+    --PROMETHEUS_VERSION=*) PROMETHEUS_VERSION="${1#*=}"; shift ;;
     --ALLOW_NO_NODES)     ALLOW_NO_NODES=1; shift ;;
+    --STOP)               ACTION="stop"; shift ;;
+    --STATUS)             ACTION="status"; shift ;;
     -h|--help)            usage; exit 0 ;;
     *) printf 'unknown arg: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
@@ -100,53 +118,68 @@ say()   { printf '\033[1;36m[gateway]\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[gateway]\033[0m %s\n' "$*" >&2; }
 fail()  { printf '\033[1;31m[gateway]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# 1. Docker — auto-install if missing.
-install_docker() {
-  say "docker not found — installing via official convenience script ..."
-  curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-  sh /tmp/get-docker.sh --mirror Aliyun
-  rm -f /tmp/get-docker.sh
-  if [ "$(id -u)" -ne 0 ] && ! groups | grep -qw docker; then
-    sudo usermod -aG docker "$(whoami)" || true
-  fi
-  if command -v systemctl >/dev/null 2>&1; then
-    sudo systemctl enable --now docker
-  fi
-  command -v docker >/dev/null 2>&1 \
-    || fail "docker installation failed — please install manually: https://docs.docker.com/engine/install/"
-  say "docker installed successfully."
+PID_FILE="${INSTALL_DIR}/prometheus.pid"
+LOG_FILE="${INSTALL_DIR}/prometheus.log"
+DATA_DIR="${INSTALL_DIR}/data"
+CONFIG_FILE="${INSTALL_DIR}/prometheus.yml"
+BIN="${INSTALL_DIR}/prometheus"
+
+agent_pid() {
+  [ -f "${PID_FILE}" ] || return 1
+  local pid
+  pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "${pid}" 2>/dev/null || return 1
+  printf '%s' "${pid}"
 }
 
-install_docker_compose() {
-  say "docker compose not found — installing the v2 plugin ..."
-  local compose_version="v2.29.2"
-  local arch
-  arch="$(uname -m)"
-  case "${arch}" in
-    x86_64)  arch="x86_64" ;;
-    aarch64|arm64) arch="aarch64" ;;
-    *) fail "unsupported architecture: ${arch}" ;;
-  esac
-  local dest="${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins"
-  mkdir -p "${dest}"
-  curl -fsSL "https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-${arch}" \
-    -o "${dest}/docker-compose"
-  chmod +x "${dest}/docker-compose"
-  docker compose version >/dev/null 2>&1 \
-    || fail "docker compose installation failed — please install manually: https://docs.docker.com/compose/install/"
-  say "docker compose installed successfully."
+stop_agent() {
+  local pid
+  if pid="$(agent_pid)"; then
+    say "stopping prometheus-agent (pid=${pid}) ..."
+    kill "${pid}" 2>/dev/null || true
+    local waited=0
+    while kill -0 "${pid}" 2>/dev/null; do
+      sleep 0.5
+      waited=$((waited + 1))
+      if [ "${waited}" -ge 20 ]; then
+        warn "agent did not exit after 10s — sending SIGKILL."
+        kill -9 "${pid}" 2>/dev/null || true
+        break
+      fi
+    done
+    rm -f "${PID_FILE}"
+    say "prometheus-agent stopped."
+  else
+    say "no running prometheus-agent."
+    rm -f "${PID_FILE}"
+  fi
 }
 
-command -v docker >/dev/null 2>&1 || install_docker
+# Sub-command short-circuits.
+case "${ACTION}" in
+  stop)
+    stop_agent
+    exit 0
+    ;;
+  status)
+    if pid="$(agent_pid)"; then
+      say "prometheus-agent running (pid=${pid})."
+      say "  UI:       http://127.0.0.1:${AGENT_PORT}"
+      say "  Log:      ${LOG_FILE}"
+      say "  Config:   ${CONFIG_FILE}"
+      exit 0
+    else
+      say "prometheus-agent is not running."
+      exit 1
+    fi
+    ;;
+esac
 
-if docker compose version >/dev/null 2>&1; then
-  COMPOSE=(docker compose)
-elif command -v docker-compose >/dev/null 2>&1; then
-  COMPOSE=(docker-compose)
-else
-  install_docker_compose
-  COMPOSE=(docker compose)
-fi
+# 1. Sanity-check the runtime prerequisites — pure userland, no sudo / no docker.
+for cmd in curl tar awk; do
+  command -v "${cmd}" >/dev/null 2>&1 || fail "required command '${cmd}' not found in PATH"
+done
 
 # 2. Parse the compute-node list into parallel LABELS[] and ENDPOINTS[] arrays.
 #    Each input entry is [label=]host[:port]; missing label -> host, missing port -> EXPORTER_PORT.
@@ -156,7 +189,6 @@ declare -A SEEN_LABELS=()
 
 add_node() {
   local raw="$1" label host port hostport
-  # strip leading/trailing whitespace
   raw="${raw#"${raw%%[![:space:]]*}"}"
   raw="${raw%"${raw##*[![:space:]]}"}"
   [ -z "${raw}" ] && return 0
@@ -222,7 +254,7 @@ for i in "${!LABELS[@]}"; do
 done
 
 # 3. Pre-flight: probe each compute node's /metrics. Warn per unreachable;
-#    fail if *zero* are reachable unless --ALLOW_NO_NODES.
+#    fail if zero are reachable unless --ALLOW_NO_NODES.
 say "probing compute node exporters ..."
 reachable=0
 for i in "${!LABELS[@]}"; do
@@ -249,15 +281,15 @@ else
   warn "redeploy the server with the install.sh in this repo — it sets the flag by default."
 fi
 
-# 5. Warn if remote_write target is loopback (only valid when central Prometheus
-#    runs on this same login node — uncommon but possible).
-case "${REMOTE_WRITE_URL}" in
-  *://127.0.0.1:*|*://127.0.0.1/*|*://localhost:*|*://localhost/*)
-    warn "remote_write target is loopback (${REMOTE_WRITE_URL}) — this only works if the central Prometheus is on this same login node."
-    ;;
-esac
+# 5. Pre-flight: agent port must be free (after we account for any already-running
+#    instance owned by this script — we'll stop that below before binding).
+existing_pid=""
+if existing_pid="$(agent_pid)"; then
+  say "found existing prometheus-agent (pid=${existing_pid}) — will stop and restart with the new config."
+else
+  existing_pid=""
+fi
 
-# 6. Pre-flight: agent port must be free on the host.
 port_busy() {
   local p="$1"
   if command -v ss >/dev/null 2>&1; then
@@ -268,16 +300,66 @@ port_busy() {
     return 1
   fi
 }
-if port_busy "${AGENT_PORT}"; then
-  fail "AGENT_PORT ${AGENT_PORT} is already bound on this host — pick another with --AGENT_PORT."
+
+if [ -z "${existing_pid}" ] && port_busy "${AGENT_PORT}"; then
+  fail "AGENT_PORT ${AGENT_PORT} is already bound by some other process — pick another with --AGENT_PORT."
 fi
 
-# 7. Materialize config files.
-say "writing config to ${INSTALL_DIR} (cluster=${CLUSTER_LABEL}, remote_write=${REMOTE_WRITE_URL}) ..."
-mkdir -p "${INSTALL_DIR}"
-cd "${INSTALL_DIR}"
+# 6. Layout the install dir.
+say "preparing install dir ${INSTALL_DIR} ..."
+mkdir -p "${INSTALL_DIR}" "${DATA_DIR}"
 
-# Build the static_configs body once so the prometheus.yml heredoc can include it.
+# 7. Download the Prometheus binary if missing or version mismatch.
+detect_arch() {
+  local m
+  m="$(uname -m)"
+  case "${m}" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l) echo "armv7" ;;
+    *) fail "unsupported architecture: ${m}" ;;
+  esac
+}
+
+current_version="$( "${BIN}" --version 2>&1 | awk '/prometheus,? version/{for(i=1;i<=NF;i++) if($i=="version") {print $(i+1); exit}}' 2>/dev/null || true )"
+if [ -x "${BIN}" ] && [ "${current_version}" = "${PROMETHEUS_VERSION}" ]; then
+  say "prometheus ${PROMETHEUS_VERSION} already present at ${BIN}."
+else
+  arch="$(detect_arch)"
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  case "${os}" in
+    linux|darwin) ;;
+    *) fail "unsupported OS: ${os}" ;;
+  esac
+  tarball="prometheus-${PROMETHEUS_VERSION}.${os}-${arch}.tar.gz"
+  url="${PROMETHEUS_DOWNLOAD_BASE}/v${PROMETHEUS_VERSION}/${tarball}"
+  say "downloading ${url} ..."
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "${tmpdir}"' EXIT
+  if ! curl -fL --retry 3 --connect-timeout 10 -o "${tmpdir}/${tarball}" "${url}"; then
+    fail "failed to download prometheus from ${url} — check network or override --PROMETHEUS_VERSION / PROMETHEUS_DOWNLOAD_BASE."
+  fi
+  say "extracting ..."
+  tar -xzf "${tmpdir}/${tarball}" -C "${tmpdir}"
+  extracted_dir="${tmpdir}/prometheus-${PROMETHEUS_VERSION}.${os}-${arch}"
+  [ -x "${extracted_dir}/prometheus" ] \
+    || fail "extracted tarball does not contain a prometheus binary at expected path"
+  install -m 0755 "${extracted_dir}/prometheus" "${BIN}"
+  trap - EXIT
+  rm -rf "${tmpdir}"
+  say "installed prometheus ${PROMETHEUS_VERSION} -> ${BIN}"
+fi
+
+# 8. Warn if remote_write target is loopback.
+case "${REMOTE_WRITE_URL}" in
+  *://127.0.0.1:*|*://127.0.0.1/*|*://localhost:*|*://localhost/*)
+    warn "remote_write target is loopback (${REMOTE_WRITE_URL}) — this only works if the central Prometheus is on this same login node."
+    ;;
+esac
+
+# 9. Materialize prometheus.yml.
+say "writing config to ${CONFIG_FILE} (cluster=${CLUSTER_LABEL}, remote_write=${REMOTE_WRITE_URL}) ..."
+
 static_configs_body=""
 for i in "${!LABELS[@]}"; do
   static_configs_body+="      - targets: [\"${ENDPOINTS[$i]}\"]"$'\n'
@@ -285,32 +367,7 @@ for i in "${!LABELS[@]}"; do
   static_configs_body+="          instance: ${LABELS[$i]}"$'\n'
 done
 
-cat > docker-compose.yml <<YAML
-# Login-node gateway deployment — generated by install.sh; re-running overwrites this.
-services:
-  prometheus-agent:
-    image: prom/prometheus:v2.55.0
-    container_name: gpu-monitor-gw-prometheus-agent
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prom-agent-data:/prometheus
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --enable-feature=agent
-      - --storage.agent.path=/prometheus
-      - --web.listen-address=127.0.0.1:${AGENT_PORT}
-    environment:
-      - http_proxy=\${HTTP_PROXY:-}
-      - https_proxy=\${HTTPS_PROXY:-}
-      - no_proxy=\${NO_PROXY:-localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
-
-volumes:
-  prom-agent-data:
-YAML
-
-cat > prometheus.yml <<YAML
+cat > "${CONFIG_FILE}" <<YAML
 global:
   scrape_interval: ${SCRAPE_INTERVAL}
   scrape_timeout: 10s
@@ -333,11 +390,44 @@ remote_write:
         action: keep
 YAML
 
-# 8. Bring the agent up.
-say "starting prometheus-agent ..."
-AGENT_PORT="${AGENT_PORT}" "${COMPOSE[@]}" up -d
+# 10. Stop the previously-launched agent (if any) before binding the port.
+if [ -n "${existing_pid}" ]; then
+  stop_agent
+fi
 
-# 9. Wait for /-/ready.
+# 11. Build a no_proxy list that includes every compute-node host so that an
+#     HTTPS_PROXY set in the user's shell environment doesn't intercept scrapes.
+no_proxy_existing="${NO_PROXY:-${no_proxy:-}}"
+no_proxy_value="localhost,127.0.0.1"
+for ep in "${ENDPOINTS[@]}"; do
+  no_proxy_value+=",${ep%:*}"
+done
+[ -n "${no_proxy_existing}" ] && no_proxy_value="${no_proxy_existing},${no_proxy_value}"
+
+# 12. Launch the agent as a detached background process.
+say "starting prometheus-agent on 127.0.0.1:${AGENT_PORT} ..."
+# shellcheck disable=SC2086
+nohup env \
+  no_proxy="${no_proxy_value}" \
+  NO_PROXY="${no_proxy_value}" \
+  "${BIN}" \
+    --config.file="${CONFIG_FILE}" \
+    --enable-feature=agent \
+    --storage.agent.path="${DATA_DIR}" \
+    --web.listen-address="127.0.0.1:${AGENT_PORT}" \
+  > "${LOG_FILE}" 2>&1 < /dev/null &
+agent_pid_started=$!
+echo "${agent_pid_started}" > "${PID_FILE}"
+sleep 0.5
+
+if ! kill -0 "${agent_pid_started}" 2>/dev/null; then
+  warn "prometheus-agent exited immediately — tail of log:"
+  tail -n 30 "${LOG_FILE}" >&2 || true
+  fail "agent failed to start; see ${LOG_FILE} for details."
+fi
+say "prometheus-agent started (pid=${agent_pid_started}, log=${LOG_FILE})."
+
+# 13. Wait for /-/ready.
 say "waiting for prometheus-agent /-/ready ..."
 agent_ready=0
 for i in {1..20}; do
@@ -349,9 +439,9 @@ for i in {1..20}; do
   sleep 1
 done
 [ "${agent_ready}" = 1 ] \
-  || warn "prometheus-agent did not become ready after 20s — check 'docker logs -f gpu-monitor-gw-prometheus-agent'."
+  || warn "prometheus-agent did not become ready after 20s — check ${LOG_FILE}."
 
-# 10. Report scrape-target health in aggregate.
+# 14. Aggregate scrape-target health.
 say "checking scrape-target health (give it a few seconds for the first scrape) ..."
 sleep 3
 targets_json="$(curl -fsS "http://127.0.0.1:${AGENT_PORT}/api/v1/targets" 2>/dev/null || true)"
@@ -367,7 +457,7 @@ else
   warn "could not query /api/v1/targets — agent may still be coming up."
 fi
 
-# 11. Confirm at least one batch has flushed successfully.
+# 15. Confirm at least one batch has flushed successfully.
 say "checking remote_write delivery (this can take ~${SCRAPE_INTERVAL} for the first scrape) ..."
 sent_ok=0
 for i in {1..6}; do
@@ -388,10 +478,62 @@ done
 
 if [ "${sent_ok}" = 0 ]; then
   warn "no successful remote_write delivery confirmed yet — keep watching:"
-  warn "  docker logs -f gpu-monitor-gw-prometheus-agent"
+  warn "  tail -f ${LOG_FILE}"
 fi
 
-# 12. Final banner.
+# 16. Drop tiny standalone helper scripts so the user can stop/status the agent
+#     even when install.sh was invoked via curl-pipe (no install.sh on disk).
+cat > "${INSTALL_DIR}/stop.sh" <<'HELPER'
+#!/usr/bin/env bash
+set -eu
+PID_FILE="$(cd "$(dirname "$0")" && pwd)/prometheus.pid"
+if [ ! -f "${PID_FILE}" ]; then
+  echo "no PID file at ${PID_FILE} — agent not running."
+  exit 0
+fi
+pid="$(cat "${PID_FILE}")"
+if ! kill -0 "${pid}" 2>/dev/null; then
+  echo "recorded pid ${pid} is not alive — cleaning up ${PID_FILE}."
+  rm -f "${PID_FILE}"
+  exit 0
+fi
+echo "stopping prometheus-agent (pid=${pid}) ..."
+kill "${pid}" 2>/dev/null || true
+waited=0
+while kill -0 "${pid}" 2>/dev/null; do
+  sleep 0.5
+  waited=$((waited + 1))
+  if [ "${waited}" -ge 20 ]; then
+    echo "agent did not exit after 10s — sending SIGKILL."
+    kill -9 "${pid}" 2>/dev/null || true
+    break
+  fi
+done
+rm -f "${PID_FILE}"
+echo "stopped."
+HELPER
+chmod +x "${INSTALL_DIR}/stop.sh"
+
+cat > "${INSTALL_DIR}/status.sh" <<'HELPER'
+#!/usr/bin/env bash
+set -eu
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PID_FILE="${DIR}/prometheus.pid"
+if [ -f "${PID_FILE}" ]; then
+  pid="$(cat "${PID_FILE}")"
+  if kill -0 "${pid}" 2>/dev/null; then
+    echo "prometheus-agent running (pid=${pid})"
+    echo "  log:    ${DIR}/prometheus.log"
+    echo "  config: ${DIR}/prometheus.yml"
+    exit 0
+  fi
+fi
+echo "prometheus-agent is not running"
+exit 1
+HELPER
+chmod +x "${INSTALL_DIR}/status.sh"
+
+# 17. Final banner.
 node_list=""
 for i in "${!LABELS[@]}"; do
   node_list+="    ${LABELS[$i]} -> ${ENDPOINTS[$i]}"$'\n'
@@ -403,18 +545,28 @@ cat <<EOF
   GPU push gateway for cluster '${CLUSTER_LABEL}' is up.
 
   Install dir: ${INSTALL_DIR}
+  PID file:    ${PID_FILE}  (pid=${agent_pid_started})
+  Log file:    ${LOG_FILE}
 
   Compute nodes scraped:
 ${node_list}
+  Manage:
+    ${INSTALL_DIR}/status.sh        # check whether it's running
+    ${INSTALL_DIR}/stop.sh          # stop the agent
+    tail -f ${LOG_FILE}
+    # Re-run install.sh (with --COMPUTE_NODES etc.) to reconfigure + restart.
+
   Local checks:
     curl http://127.0.0.1:${AGENT_PORT}/-/ready          # agent
     curl http://127.0.0.1:${AGENT_PORT}/api/v1/targets   # per-node health
-    docker logs -f gpu-monitor-gw-prometheus-agent       # push log
 
   Verify in the server Prometheus:
     ${PROMETHEUS_URL}/graph?g0.expr=DCGM_FI_DEV_GPU_UTIL%7Bcluster%3D%22${CLUSTER_LABEL}%22%7D
 
   Grafana:    ${GRAFANA_URL}
   Prometheus: ${PROMETHEUS_URL}
+
+  Survive reboot (no systemd / no sudo): add a crontab entry, e.g.
+    (crontab -l 2>/dev/null; echo "@reboot $0 --COMPUTE_NODES '${COMPUTE_NODES}' --PROMETHEUS_URL '${PROMETHEUS_URL}' --INSTALL_DIR '${INSTALL_DIR}'") | crontab -
 ================================================================
 EOF

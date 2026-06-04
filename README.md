@@ -38,8 +38,12 @@ containers.
 
 ## Prerequisites
 
-- Docker with Compose v2 plugin
-- (Client only) NVIDIA driver + NVIDIA Container Toolkit
+- **Server** (section 1) and **per-host client** (section 2): Docker with
+  Compose v2 plugin; the client also needs NVIDIA driver + NVIDIA Container
+  Toolkit.
+- **Login-node gateway** (section 3): only `curl`, `tar`, `awk` — no docker,
+  no sudo, no systemd. The Prometheus binary is downloaded into
+  `${INSTALL_DIR}` and run as a `nohup` background process.
 
 ## 1. Bring up the visualization host (Prometheus + Grafana)
 ```bash
@@ -110,12 +114,18 @@ compute node and then deploy a single gateway agent on the login node.
 The gateway scrapes every compute node's `:9400/metrics` and
 `remote_write`s the samples to the central Prometheus.
 
+This deployment is **pure-userland**: no docker, no docker-compose, no
+sudo, no systemd units. The script downloads the official Prometheus
+release tarball into `${INSTALL_DIR}` and runs it as a `nohup`
+background process tracked by a PID file.
+
 ```
 ┌─────────────────┐      ┌──────────────────────┐                         ┌────────────────────────┐
 │ compute01:9400  │◀─┐   │ Login node           │   remote_write (push)   │ Visualization (shared) │
 │ compute02:9400  │◀─┼───│ client-gateway/      │ ──────────────────────▶ │  Prometheus :9090      │
 │ compute03:9400  │◀─┘   │  install.sh          │                         │  Grafana    :3000      │
-│ (dcgm-exporter) │      │  - prometheus-agent  │                         │  server/install.sh     │
+│ (dcgm-exporter) │      │  prometheus agent    │                         │  server/install.sh     │
+│                 │      │  (nohup, no docker)  │                         │                        │
 └─────────────────┘      └──────────────────────┘                         └────────────────────────┘
    internal network          login node has both
    only                      networks
@@ -152,22 +162,40 @@ For larger clusters, pass `--COMPUTE_NODES_FILE /path/to/nodes.txt`
 | `--EXPORTER_PORT` | `9400` |
 | `--AGENT_PORT` | `9091` |
 | `--INSTALL_DIR` | `$(pwd)/gpu-monitor-gateway` |
+| `--PROMETHEUS_VERSION` | `2.55.0` |
 | `--ALLOW_NO_NODES` | *(off)* — continue when 0 compute nodes respond at pre-flight |
 
-The gateway agent runs in `network_mode: host` so it can resolve the
-compute-node hostnames via the login node's `/etc/hosts` / DNS and reach
-them on the internal network with no `extra_hosts` plumbing. The agent
-UI is still bound to `127.0.0.1:${AGENT_PORT}` only.
+The agent UI is bound to `127.0.0.1:${AGENT_PORT}` only. `no_proxy` is
+populated with every compute-node host at start time so a shell
+`HTTPS_PROXY` doesn't accidentally intercept the scrapes.
+
+**Manage the running agent:**
+
+`install.sh` writes two tiny standalone helpers next to the binary, so
+you don't need the install script on disk to control the agent:
+
+```bash
+${INSTALL_DIR}/status.sh        # is it running? pid? log path?
+${INSTALL_DIR}/stop.sh          # graceful stop, then SIGKILL after 10s
+tail -f ${INSTALL_DIR}/prometheus.log
+# To reconfigure + restart: re-run install.sh with new --COMPUTE_NODES etc.
+```
+
+If you have install.sh saved locally, `install.sh --STATUS` / `--STOP`
+work too.
 
 The gateway script:
-1. Verifies Docker (no NVIDIA driver needed — no GPU on the login node).
+1. Sanity-checks `curl`, `tar`, `awk` (no other runtime deps — no docker,
+   no NVIDIA driver, no root).
 2. Parses + validates the node list; rejects duplicate `instance` labels.
 3. Probes each compute node's `/metrics`; warns per unreachable node and
    fails on zero reachable unless `--ALLOW_NO_NODES`.
 4. Probes the server Prometheus for the receiver flag.
 5. Confirms `--AGENT_PORT` is free on the login node.
-6. Writes `docker-compose.yml` + `prometheus.yml` to `${INSTALL_DIR}`.
-7. `docker compose up -d`, waits for `/-/ready`, reports per-node
+6. Downloads `prometheus-${PROMETHEUS_VERSION}` if missing or version
+   mismatch; writes `prometheus.yml` next to it.
+7. Stops any previously-launched agent (via the PID file), then
+   `nohup`-launches the new one, waits for `/-/ready`, reports per-node
    target health, and confirms at least one successful `remote_write`
    batch.
 
@@ -177,6 +205,14 @@ both the cluster and the individual compute node:
 
 ```promql
 DCGM_FI_DEV_GPU_UTIL{cluster="<login-hostname>", instance="compute01"}
+```
+
+**Survive reboot without sudo/systemd:**
+
+```bash
+(crontab -l 2>/dev/null; \
+ echo "@reboot ${INSTALL_DIR}/install.sh --COMPUTE_NODES 'compute01,compute02,compute03' --PROMETHEUS_URL 'http://<server-host>:9090' --INSTALL_DIR '${INSTALL_DIR}'" \
+) | crontab -
 ```
 
 ## Retrofit an existing Prometheus
