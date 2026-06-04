@@ -102,6 +102,83 @@ The client script:
 6. Confirms at least one successful `remote_write` batch (no failed
    samples).
 
+## 3. Deploy on the login node when compute nodes are air-gapped
+When the compute nodes can't reach the central Prometheus directly
+(typical HPC layout: login node ↔ external network ↔ compute nodes that
+only see the internal network), run `dcgm-exporter` manually on each
+compute node and then deploy a single gateway agent on the login node.
+The gateway scrapes every compute node's `:9400/metrics` and
+`remote_write`s the samples to the central Prometheus.
+
+```
+┌─────────────────┐      ┌──────────────────────┐                         ┌────────────────────────┐
+│ compute01:9400  │◀─┐   │ Login node           │   remote_write (push)   │ Visualization (shared) │
+│ compute02:9400  │◀─┼───│ client-gateway/      │ ──────────────────────▶ │  Prometheus :9090      │
+│ compute03:9400  │◀─┘   │  install.sh          │                         │  Grafana    :3000      │
+│ (dcgm-exporter) │      │  - prometheus-agent  │                         │  server/install.sh     │
+└─────────────────┘      └──────────────────────┘                         └────────────────────────┘
+   internal network          login node has both
+   only                      networks
+```
+
+```bash
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/DiscoverRobotics/gpu_monitor/main/client-gateway/install.sh)" -- \
+  --PROMETHEUS_URL http://<server-host>:9090 \
+  --GRAFANA_URL    http://<server-host>:3000 \
+  --COMPUTE_NODES  compute01,compute02,compute03
+```
+
+Each entry in `--COMPUTE_NODES` is `[label=]host[:port]`. The hostname is
+the default `instance` label and `--EXPORTER_PORT` (default `9400`) the
+default port. Use the explicit `label=` form when scraping by IP or when
+you want a friendlier instance name:
+
+```bash
+--COMPUTE_NODES gpu1=10.0.0.11,gpu2=10.0.0.12:9400,gpu3=10.0.0.13
+```
+
+For larger clusters, pass `--COMPUTE_NODES_FILE /path/to/nodes.txt`
+(one entry per line, `#` comments and blank lines ignored).
+
+| Flag / env var | Default |
+|----------------|---------|
+| `--PROMETHEUS_URL` | `http://43.133.11.173:9090` |
+| `--GRAFANA_URL` | `http://43.133.11.173:3000` |
+| `--REMOTE_WRITE_URL` | `<PROMETHEUS_URL>/api/v1/write` |
+| `--COMPUTE_NODES` | *(required)* |
+| `--COMPUTE_NODES_FILE` | *(none)* |
+| `--CLUSTER_LABEL` | `$(hostname)` — attached as `external_labels.cluster` |
+| `--SCRAPE_INTERVAL` | `15s` |
+| `--EXPORTER_PORT` | `9400` |
+| `--AGENT_PORT` | `9091` |
+| `--INSTALL_DIR` | `$(pwd)/gpu-monitor-gateway` |
+| `--ALLOW_NO_NODES` | *(off)* — continue when 0 compute nodes respond at pre-flight |
+
+The gateway agent runs in `network_mode: host` so it can resolve the
+compute-node hostnames via the login node's `/etc/hosts` / DNS and reach
+them on the internal network with no `extra_hosts` plumbing. The agent
+UI is still bound to `127.0.0.1:${AGENT_PORT}` only.
+
+The gateway script:
+1. Verifies Docker (no NVIDIA driver needed — no GPU on the login node).
+2. Parses + validates the node list; rejects duplicate `instance` labels.
+3. Probes each compute node's `/metrics`; warns per unreachable node and
+   fails on zero reachable unless `--ALLOW_NO_NODES`.
+4. Probes the server Prometheus for the receiver flag.
+5. Confirms `--AGENT_PORT` is free on the login node.
+6. Writes `docker-compose.yml` + `prometheus.yml` to `${INSTALL_DIR}`.
+7. `docker compose up -d`, waits for `/-/ready`, reports per-node
+   target health, and confirms at least one successful `remote_write`
+   batch.
+
+Each series is tagged with the per-node `instance` label and the
+`cluster=${CLUSTER_LABEL}` external label, so dashboards can filter by
+both the cluster and the individual compute node:
+
+```promql
+DCGM_FI_DEV_GPU_UTIL{cluster="<login-hostname>", instance="compute01"}
+```
+
 ## Retrofit an existing Prometheus
 If the visualization host already runs its own Prometheus and you don't
 want `server/install.sh` to replace it, just enable the remote-write
@@ -118,7 +195,7 @@ recreates the container, and verifies the flag is reported.
 ## Stop / clean up
 The install dir is a normal docker-compose project, so:
 ```bash
-cd ~/gpu-monitor-server      # or gpu-monitor-client
+cd ~/gpu-monitor-server      # or gpu-monitor-client, or gpu-monitor-gateway
 docker compose down          # stop containers, keep data
 docker compose down -v       # also wipe persistent volumes
 ```
