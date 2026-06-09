@@ -140,11 +140,30 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/DiscoverRobotics/gpu_monit
 
 Each entry in `--COMPUTE_NODES` is `[label=]host[:port]`. The hostname is
 the default `instance` label and `--EXPORTER_PORT` (default `9400`) the
-default port. Use the explicit `label=` form when scraping by IP or when
-you want a friendlier instance name:
+default port. Compute nodes are commonly addressed by IP — pass them
+directly, with or without the port:
+
+```bash
+--COMPUTE_NODES 214.30.239.40:9400,214.30.239.42:9400
+```
+
+Use the explicit `label=` form when you want a friendlier instance name
+than the bare IP:
 
 ```bash
 --COMPUTE_NODES gpu1=10.0.0.11,gpu2=10.0.0.12:9400,gpu3=10.0.0.13
+```
+
+The login node is the only host with outbound access, so by default the
+script downloads the Prometheus release from GitHub there. If that download
+is blocked, either point at a mirror with `--PROMETHEUS_DOWNLOAD_BASE`, or
+pre-stage the binary you already have and skip the download entirely:
+
+```bash
+# reuse a prometheus binary you copied onto the login node
+... --PROMETHEUS_BINARY  /home/me/prometheus
+# or extract a release tarball you copied over
+... --PROMETHEUS_TARBALL /home/me/prometheus-2.55.0.linux-amd64.tar.gz
 ```
 
 For larger clusters, pass `--COMPUTE_NODES_FILE /path/to/nodes.txt`
@@ -163,6 +182,9 @@ For larger clusters, pass `--COMPUTE_NODES_FILE /path/to/nodes.txt`
 | `--AGENT_PORT` | `9091` |
 | `--INSTALL_DIR` | `$(pwd)/gpu-monitor-gateway` |
 | `--PROMETHEUS_VERSION` | `2.55.0` |
+| `--PROMETHEUS_BINARY` | *(none)* — use a pre-staged binary instead of downloading |
+| `--PROMETHEUS_TARBALL` | *(none)* — extract a pre-staged release tarball instead of downloading |
+| `--PROMETHEUS_DOWNLOAD_BASE` | `https://github.com/prometheus/prometheus/releases/download` |
 | `--ALLOW_NO_NODES` | *(off)* — continue when 0 compute nodes respond at pre-flight |
 
 The agent UI is bound to `127.0.0.1:${AGENT_PORT}` only. `no_proxy` is
@@ -192,8 +214,10 @@ The gateway script:
    fails on zero reachable unless `--ALLOW_NO_NODES`.
 4. Probes the server Prometheus for the receiver flag.
 5. Confirms `--AGENT_PORT` is free on the login node.
-6. Downloads `prometheus-${PROMETHEUS_VERSION}` if missing or version
-   mismatch; writes `prometheus.yml` next to it.
+6. Resolves the prometheus binary — a `--PROMETHEUS_BINARY` /
+   `--PROMETHEUS_TARBALL` you staged, else an already-present matching
+   version, else downloads `prometheus-${PROMETHEUS_VERSION}`; writes
+   `prometheus.yml` next to it.
 7. Stops any previously-launched agent (via the PID file), then
    `nohup`-launches the new one, waits for `/-/ready`, reports per-node
    target health, and confirms at least one successful `remote_write`

@@ -44,6 +44,11 @@ ALLOW_NO_NODES="${ALLOW_NO_NODES:-0}"
 INSTALL_DIR="${INSTALL_DIR:-$(pwd)/gpu-monitor-gateway}"
 PROMETHEUS_VERSION="${PROMETHEUS_VERSION:-2.55.0}"
 PROMETHEUS_DOWNLOAD_BASE="${PROMETHEUS_DOWNLOAD_BASE:-https://github.com/prometheus/prometheus/releases/download}"
+# Offline / pre-staged binary support: the login node is the only host with
+# outbound access, so when the release download is blocked you can drop a
+# binary (or release tarball) next to the script and point these at it.
+PROMETHEUS_BINARY="${PROMETHEUS_BINARY:-}"
+PROMETHEUS_TARBALL="${PROMETHEUS_TARBALL:-}"
 ACTION="install"
 
 usage() {
@@ -71,6 +76,11 @@ Options:
   --AGENT_PORT     <port>  Host port for the agent UI on 127.0.0.1 (default: ${AGENT_PORT})
   --INSTALL_DIR    <dir>   Where to install + run the agent (default: ${INSTALL_DIR})
   --PROMETHEUS_VERSION <v> Prometheus release to download (default: ${PROMETHEUS_VERSION})
+  --PROMETHEUS_BINARY <p>  Use a pre-staged prometheus binary instead of downloading
+                           (e.g. one you copied to this login node manually).
+  --PROMETHEUS_TARBALL <p> Extract a pre-staged release tarball instead of downloading.
+  --PROMETHEUS_DOWNLOAD_BASE <url>
+                           Release mirror base (default: ${PROMETHEUS_DOWNLOAD_BASE})
   --ALLOW_NO_NODES         Continue even if zero compute nodes are reachable at pre-flight.
   --STOP                   Stop the running agent and exit.
   --STATUS                 Report agent status (running/stopped) and exit.
@@ -104,6 +114,12 @@ while [ $# -gt 0 ]; do
     --INSTALL_DIR=*)      INSTALL_DIR="${1#*=}"; shift ;;
     --PROMETHEUS_VERSION) PROMETHEUS_VERSION="$2"; shift 2 ;;
     --PROMETHEUS_VERSION=*) PROMETHEUS_VERSION="${1#*=}"; shift ;;
+    --PROMETHEUS_BINARY)  PROMETHEUS_BINARY="$2"; shift 2 ;;
+    --PROMETHEUS_BINARY=*) PROMETHEUS_BINARY="${1#*=}"; shift ;;
+    --PROMETHEUS_TARBALL) PROMETHEUS_TARBALL="$2"; shift 2 ;;
+    --PROMETHEUS_TARBALL=*) PROMETHEUS_TARBALL="${1#*=}"; shift ;;
+    --PROMETHEUS_DOWNLOAD_BASE) PROMETHEUS_DOWNLOAD_BASE="$2"; shift 2 ;;
+    --PROMETHEUS_DOWNLOAD_BASE=*) PROMETHEUS_DOWNLOAD_BASE="${1#*=}"; shift ;;
     --ALLOW_NO_NODES)     ALLOW_NO_NODES=1; shift ;;
     --STOP)               ACTION="stop"; shift ;;
     --STATUS)             ACTION="status"; shift ;;
@@ -117,6 +133,16 @@ REMOTE_WRITE_URL="${REMOTE_WRITE_URL:-${PROMETHEUS_URL}/api/v1/write}"
 say()   { printf '\033[1;36m[gateway]\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[gateway]\033[0m %s\n' "$*" >&2; }
 fail()  { printf '\033[1;31m[gateway]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Extract the bare host from a URL (drop scheme, path, userinfo, port).
+url_host() {
+  local u="$1"
+  u="${u#*://}"   # strip scheme://
+  u="${u%%/*}"    # strip /path
+  u="${u##*@}"    # strip user:pass@
+  u="${u%%:*}"    # strip :port
+  printf '%s' "${u}"
+}
 
 PID_FILE="${INSTALL_DIR}/prometheus.pid"
 LOG_FILE="${INSTALL_DIR}/prometheus.log"
@@ -309,7 +335,11 @@ fi
 say "preparing install dir ${INSTALL_DIR} ..."
 mkdir -p "${INSTALL_DIR}" "${DATA_DIR}"
 
-# 7. Download the Prometheus binary if missing or version mismatch.
+# 7. Obtain the Prometheus binary. Resolution order, first match wins:
+#      a) --PROMETHEUS_BINARY <path>   use a pre-staged binary as-is
+#      b) --PROMETHEUS_TARBALL <path>  extract a pre-staged release tarball
+#      c) existing ${BIN} of matching version  reuse
+#      d) download the release tarball from PROMETHEUS_DOWNLOAD_BASE
 detect_arch() {
   local m
   m="$(uname -m)"
@@ -321,30 +351,63 @@ detect_arch() {
   esac
 }
 
+os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+case "${os}" in
+  linux|darwin) ;;
+  *) fail "unsupported OS: ${os}" ;;
+esac
+arch="$(detect_arch)"
+
+# Pull the prometheus binary out of an extracted release tree and install it.
+install_from_tarball() {
+  local tb="$1" td extracted bin
+  td="$(mktemp -d)"
+  if ! tar -xzf "${tb}" -C "${td}" 2>/dev/null; then
+    rm -rf "${td}"
+    fail "failed to extract '${tb}' — is it a prometheus release tar.gz for ${os}-${arch}?"
+  fi
+  # Prefer the canonical path, but fall back to a recursive search so a
+  # differently-named tarball still works.
+  extracted="${td}/prometheus-${PROMETHEUS_VERSION}.${os}-${arch}/prometheus"
+  if [ ! -x "${extracted}" ]; then
+    extracted="$(find "${td}" -type f -name prometheus 2>/dev/null | head -n1)"
+  fi
+  [ -n "${extracted}" ] && [ -f "${extracted}" ] \
+    || { rm -rf "${td}"; fail "no prometheus binary found inside '${tb}'"; }
+  install -m 0755 "${extracted}" "${BIN}"
+  rm -rf "${td}"
+}
+
 current_version="$( "${BIN}" --version 2>&1 | awk '/prometheus,? version/{for(i=1;i<=NF;i++) if($i=="version") {print $(i+1); exit}}' 2>/dev/null || true )"
-if [ -x "${BIN}" ] && [ "${current_version}" = "${PROMETHEUS_VERSION}" ]; then
+
+if [ -n "${PROMETHEUS_BINARY}" ]; then
+  # (a) explicit pre-staged binary.
+  [ -f "${PROMETHEUS_BINARY}" ] || fail "--PROMETHEUS_BINARY '${PROMETHEUS_BINARY}' is not a file"
+  "${PROMETHEUS_BINARY}" --version >/dev/null 2>&1 \
+    || fail "--PROMETHEUS_BINARY '${PROMETHEUS_BINARY}' does not run as a prometheus binary (wrong arch?)"
+  install -m 0755 "${PROMETHEUS_BINARY}" "${BIN}"
+  say "using pre-staged prometheus binary ${PROMETHEUS_BINARY} -> ${BIN}"
+elif [ -n "${PROMETHEUS_TARBALL}" ]; then
+  # (b) explicit pre-staged tarball.
+  [ -r "${PROMETHEUS_TARBALL}" ] || fail "cannot read --PROMETHEUS_TARBALL '${PROMETHEUS_TARBALL}'"
+  say "extracting pre-staged tarball ${PROMETHEUS_TARBALL} ..."
+  install_from_tarball "${PROMETHEUS_TARBALL}"
+  say "installed prometheus from ${PROMETHEUS_TARBALL} -> ${BIN}"
+elif [ -x "${BIN}" ] && [ "${current_version}" = "${PROMETHEUS_VERSION}" ]; then
+  # (c) right version already on disk.
   say "prometheus ${PROMETHEUS_VERSION} already present at ${BIN}."
 else
-  arch="$(detect_arch)"
-  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-  case "${os}" in
-    linux|darwin) ;;
-    *) fail "unsupported OS: ${os}" ;;
-  esac
+  # (d) download.
   tarball="prometheus-${PROMETHEUS_VERSION}.${os}-${arch}.tar.gz"
   url="${PROMETHEUS_DOWNLOAD_BASE}/v${PROMETHEUS_VERSION}/${tarball}"
   say "downloading ${url} ..."
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "${tmpdir}"' EXIT
   if ! curl -fL --retry 3 --connect-timeout 10 -o "${tmpdir}/${tarball}" "${url}"; then
-    fail "failed to download prometheus from ${url} — check network or override --PROMETHEUS_VERSION / PROMETHEUS_DOWNLOAD_BASE."
+    fail "failed to download prometheus from ${url} — check network, set a mirror with --PROMETHEUS_DOWNLOAD_BASE, or stage the binary with --PROMETHEUS_BINARY / --PROMETHEUS_TARBALL."
   fi
   say "extracting ..."
-  tar -xzf "${tmpdir}/${tarball}" -C "${tmpdir}"
-  extracted_dir="${tmpdir}/prometheus-${PROMETHEUS_VERSION}.${os}-${arch}"
-  [ -x "${extracted_dir}/prometheus" ] \
-    || fail "extracted tarball does not contain a prometheus binary at expected path"
-  install -m 0755 "${extracted_dir}/prometheus" "${BIN}"
+  install_from_tarball "${tmpdir}/${tarball}"
   trap - EXIT
   rm -rf "${tmpdir}"
   say "installed prometheus ${PROMETHEUS_VERSION} -> ${BIN}"
@@ -376,6 +439,7 @@ global:
 
 scrape_configs:
   - job_name: dcgm
+    metrics_path: /metrics
     static_configs:
 ${static_configs_body}
 remote_write:
@@ -402,6 +466,10 @@ no_proxy_value="localhost,127.0.0.1"
 for ep in "${ENDPOINTS[@]}"; do
   no_proxy_value+=",${ep%:*}"
 done
+# The remote_write push to the central Prometheus should also bypass any
+# shell proxy (it is reached directly from this login node).
+rw_host="$(url_host "${REMOTE_WRITE_URL}")"
+[ -n "${rw_host}" ] && no_proxy_value+=",${rw_host}"
 [ -n "${no_proxy_existing}" ] && no_proxy_value="${no_proxy_existing},${no_proxy_value}"
 
 # 12. Launch the agent as a detached background process.
