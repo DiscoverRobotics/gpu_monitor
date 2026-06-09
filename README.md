@@ -56,7 +56,9 @@ recreates containers.
 - **Login-node gateway** (section 3): only `curl`, `tar`, `awk` — no docker,
   no sudo, no systemd. The Prometheus binary is downloaded into
   `${INSTALL_DIR}` and run as a `nohup` background process.
-- (vast.ai only) A vast.ai API key — get one at <https://cloud.vast.ai/cli/>
+- **vast.ai monitor** (section 4): Docker with the Compose v2 plugin (the
+  install script auto-installs both if missing) plus a vast.ai API key —
+  get one at <https://cloud.vast.ai/cli/>
 
 ## 1. Bring up the visualization host (Prometheus + Grafana)
 ```bash
@@ -252,7 +254,7 @@ DCGM_FI_DEV_GPU_UTIL{cluster="<login-hostname>", instance="compute01"}
 ) | crontab -
 ```
 
-## 3. Monitor vast.ai rented instances
+## 4. Monitor vast.ai rented instances
 
 For GPUs rented on vast.ai you can't deploy `dcgm-exporter` inside the
 host, so we ship a separate exporter under `vast.ai/` that polls the
@@ -309,7 +311,8 @@ Per-instance gauges (label set: `instance_id`, `machine_id`, `gpu_name`,
 `num_gpus`, `geolocation`, `label`):
 
 - `vastai_instance_gpu_util_percent`, `vastai_instance_gpu_temp_celsius`
-- `vastai_instance_gpu_mem_used_mb`, `vastai_instance_gpu_ram_mb`
+- `vastai_instance_gpu_mem_used_mb`, `vastai_instance_gpu_ram_mb`,
+  `vastai_instance_num_gpus`
 - `vastai_instance_cpu_util_percent`, `vastai_instance_cpu_cores`,
   `vastai_instance_mem_used_gb`, `vastai_instance_mem_total_gb`
 - `vastai_instance_disk_util_percent`, `vastai_instance_disk_space_gb`

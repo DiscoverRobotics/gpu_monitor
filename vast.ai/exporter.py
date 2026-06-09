@@ -34,6 +34,19 @@ INSTANCE_LABELS = [
     "label",
 ]
 
+# Known vast.ai instance states. We always emit a 1/0 series for each of these
+# (plus the instance's actual state if it isn't in the list), so that when an
+# instance leaves a state its series drops to 0 instead of going stale — which
+# makes `vastai_instance_status{status="..."} == 1` reliable for alerting.
+STATUS_BUCKETS = (
+    "running",
+    "loading",
+    "exited",
+    "created",
+    "stopped",
+    "offline",
+)
+
 
 def _as_float(value: Any, default: float = 0.0) -> float:
     """Best-effort numeric coercion — vast.ai sometimes returns None/strings."""
@@ -180,7 +193,10 @@ class VastAICollector:
         for inst in instances:
             labels = _label_values(inst)
             status = str(inst.get("actual_status") or inst.get("cur_state") or "unknown")
-            status_metric.add_metric(labels + [status], 1.0)
+            # Emit 1/0 for every known bucket, plus a 1 for the current state
+            # even if vast.ai reports something not in STATUS_BUCKETS.
+            for bucket in (*STATUS_BUCKETS, *( (status,) if status not in STATUS_BUCKETS else () )):
+                status_metric.add_metric(labels + [bucket], 1.0 if bucket == status else 0.0)
             info_metric.add_metric(
                 labels + [
                     str(inst.get("image_uuid") or inst.get("image") or ""),
@@ -234,7 +250,10 @@ class VastAICollector:
             "Duration of the last poll of the named vast.ai endpoint.",
             labels=["endpoint"],
         )
-        for key in ("instances", "user"):
+        # Only report the user endpoint when we actually poll it, otherwise
+        # scrape_success{endpoint="user"} would read 0 and look like a failure.
+        endpoints = ("instances", "user") if self.include_user else ("instances",)
+        for key in endpoints:
             ok.add_metric([key], float(self._last_ok.get(key, 0)))
             dur.add_metric([key], float(self._last_duration.get(key, 0.0)))
         yield ok
